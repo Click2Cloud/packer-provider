@@ -21,6 +21,9 @@ func (s *stepCheckAlicloudSourceImage) Run(ctx context.Context, state multistep.
 	describeImagesRequest := ecs.CreateDescribeImagesRequest()
 	describeImagesRequest.RegionId = config.AlicloudRegion
 	describeImagesRequest.ImageId = config.AlicloudSourceImage
+	if config.AlicloudSkipImageValidation {
+		describeImagesRequest.ShowExpired = "true"
+	}
 	imagesResponse, err := client.DescribeImages(describeImagesRequest)
 	if err != nil {
 		return halt(state, err, "Error querying alicloud image")
@@ -28,7 +31,7 @@ func (s *stepCheckAlicloudSourceImage) Run(ctx context.Context, state multistep.
 
 	images := imagesResponse.Images.Image
 
-	// Describe markerplace image
+	// Describe marketplace image
 	describeImagesRequest.ImageOwnerAlias = "marketplace"
 	marketImagesResponse, err := client.DescribeImages(describeImagesRequest)
 	if err != nil {

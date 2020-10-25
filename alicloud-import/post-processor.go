@@ -1,3 +1,6 @@
+//go:generate mapstructure-to-hcl2 -type Config
+//go:generate struct-markdown
+
 package alicloudimport
 
 import (
@@ -8,15 +11,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
-
-	packerecs "github.com/alibaba/packer-provider/ecs"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/errors"
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/responses"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ecs"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/ram"
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
-	"github.com/hashicorp/packer/common"
+	"github.com/hashicorp/hcl/v2/hcldec"
+	packerecs "github.com/hashicorp/packer/builder/alicloud/ecs"
 	"github.com/hashicorp/packer/helper/config"
 	"github.com/hashicorp/packer/packer"
 	"github.com/hashicorp/packer/template/interpolate"
@@ -54,24 +56,50 @@ const (
 
 // Configuration of this post processor
 type Config struct {
-	common.PackerConfig `mapstructure:",squash"`
-	packerecs.Config    `mapstructure:",squash"`
+	packerecs.Config `mapstructure:",squash"`
 
-	// Variables specific to this post processor
-	OSSBucket                       string            `mapstructure:"oss_bucket_name"`
-	OSSKey                          string            `mapstructure:"oss_key_name"`
-	SkipClean                       bool              `mapstructure:"skip_clean"`
-	Tags                            map[string]string `mapstructure:"tags"`
-	AlicloudImageName               string            `mapstructure:"image_name"`
-	AlicloudImageDescription        string            `mapstructure:"image_description"`
-	AlicloudImageShareAccounts      []string          `mapstructure:"image_share_account"`
-	AlicloudImageDestinationRegions []string          `mapstructure:"image_copy_regions"`
-	OSType                          string            `mapstructure:"image_os_type"`
-	Platform                        string            `mapstructure:"image_platform"`
-	Architecture                    string            `mapstructure:"image_architecture"`
-	Size                            string            `mapstructure:"image_system_size"`
-	Format                          string            `mapstructure:"format"`
-	AlicloudImageForceDelete        bool              `mapstructure:"image_force_delete"`
+	// The name of the OSS bucket where the RAW or VHD file will be copied to
+	// for import. If the Bucket doesn't exist, the post-process will create it for
+	// you.
+	OSSBucket string `mapstructure:"oss_bucket_name" required:"true"`
+	// The name of the object key in `oss_bucket_name` where the RAW or VHD
+	// file will be copied to for import. This is treated as a [template
+	// engine](/docs/templates/engine), and you may access any of the variables
+	// stored in the generated data using the [build](/docs/templates/engine)
+	// template function.
+	OSSKey string `mapstructure:"oss_key_name"`
+	// Whether we should skip removing the RAW or VHD file uploaded to OSS
+	// after the import process has completed. `true` means that we should
+	// leave it in the OSS bucket, `false` means to clean it out. Defaults to
+	// `false`.
+	SkipClean bool              `mapstructure:"skip_clean"`
+	Tags      map[string]string `mapstructure:"tags"`
+	// The description of the image, with a length limit of `0` to `256`
+	// characters. Leaving it blank means null, which is the default value. It
+	// cannot begin with `http://` or `https://`.
+	AlicloudImageDescription        string   `mapstructure:"image_description"`
+	AlicloudImageShareAccounts      []string `mapstructure:"image_share_account"`
+	AlicloudImageDestinationRegions []string `mapstructure:"image_copy_regions"`
+	// Type of the OS, like linux/windows
+	OSType string `mapstructure:"image_os_type" required:"true"`
+	// Platform such as `CentOS`
+	Platform string `mapstructure:"image_platform" required:"true"`
+	// Platform type of the image system: `i386` or `x86_64`
+	Architecture string `mapstructure:"image_architecture" required:"true"`
+	// Size of the system disk, in GB, values
+	//  range:
+	//   - cloud - 5 \~ 2000
+	//   - cloud_efficiency - 20 \~ 2048
+	//   - cloud_ssd - 20 \~ 2048
+	Size string `mapstructure:"image_system_size"`
+	// The format of the image for import, now alicloud only support RAW and
+	// VHD.
+	Format string `mapstructure:"format" required:"true"`
+	// If this value is true, when the target image name is duplicated with an
+	// existing image, it will delete the existing image and then create the
+	// target image, otherwise, the creation will fail. The default value is
+	// false.
+	AlicloudImageForceDelete bool `mapstructure:"image_force_delete"`
 
 	ctx interpolate.Context
 }
@@ -84,7 +112,8 @@ type PostProcessor struct {
 	ramClient *ram.Client
 }
 
-// Entry point for configuration parsing when we've defined
+func (p *PostProcessor) ConfigSpec() hcldec.ObjectSpec { return p.config.FlatMapstructure().HCL2Spec() }
+
 func (p *PostProcessor) Configure(raws ...interface{}) error {
 	err := config.Decode(&p.config, &config.DecodeOpts{
 		Interpolate:        true,
@@ -106,6 +135,8 @@ func (p *PostProcessor) Configure(raws ...interface{}) error {
 		errs = packer.MultiErrorAppend(
 			errs, fmt.Errorf("Error parsing oss_key_name template: %s", err))
 	}
+
+	errs = packer.MultiErrorAppend(errs, p.config.AlicloudImageTag.CopyOn(&p.config.AlicloudImageTags)...)
 
 	// Check we have alicloud access variables defined somewhere
 	errs = packer.MultiErrorAppend(errs, p.config.AlicloudAccessConfig.Prepare(&p.config.ctx)...)
@@ -134,6 +165,13 @@ func (p *PostProcessor) Configure(raws ...interface{}) error {
 
 func (p *PostProcessor) PostProcess(ctx context.Context, ui packer.Ui, artifact packer.Artifact) (packer.Artifact, bool, bool, error) {
 	var err error
+
+	generatedData := artifact.State("generated_data")
+	if generatedData == nil {
+		// Make sure it's not a nil map so we can assign to it later.
+		generatedData = make(map[string]interface{})
+	}
+	p.config.ctx.Data = generatedData
 
 	// Render this key since we didn't in the configure phase
 	p.config.OSSKey, err = interpolate.Render(p.config.OSSKey, &p.config.ctx)
